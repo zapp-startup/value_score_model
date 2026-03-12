@@ -1,0 +1,57 @@
+# Tier thresholds
+tier:
+  cold_start_max_transactions: 5       # tier 1 below
+  baseline_max_transactions: 50        # tier 2 below n tier 3 above
+
+# Decay
+decay:
+  usage_lambda: 0.015                  # added a decay basically to the duration of how long the product was added since it shud hold less-ish weight as time passes
+  time_lambda: 0.003                   
+
+recommendation:
+  buy_threshold: 65
+  strong_buy_threshold: 85
+  skip_threshold: 35
+
+# Feedback from user
+feedback:
+  min_confidence: 0.3                 
+  userfact_min_confidence: 0.8         
+
+# Tier 2: XGBoost 
+xgboost:
+  n_estimators: 300
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 5
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  random_state: 42
+
+# Tier 3: Neural net
+neural:
+  user_embedding_dim: 32
+  item_embedding_dim: 16
+  hidden_dims: [128, 64, 32]
+  dropout: 0.3
+  use_gru: true                       
+  gru_seq_len: 30
+  gru_hidden: 32
+
+# Training
+training:
+  batch_size: 256
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  early_stopping_patience: 8
+  val_split: 0.15
+  test_split: 0.10
+  random_state: 42
+
+# Scoring output
+scoring:
+  output_path: "outputs/daily_scores.csv"
+  save_evidence: true                
