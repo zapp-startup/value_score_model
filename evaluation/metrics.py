@@ -11,7 +11,10 @@ def evaluate(
     verbose: bool = True,
 ) -> dict:
     
-    y_pred = predictions["value_score"].values.astype(float)
+    if "base_value_score" in predictions.columns:
+        y_pred = predictions["base_value_score"].values.astype(float)
+    else:
+        y_pred = np.clip(predictions["value_score"].values.astype(float), 0, 100)
     y_true = ground_truth.values.astype(float)
 
     results = {}
@@ -21,8 +24,12 @@ def evaluate(
     results["mean_pred"] = float(y_pred.mean())
     results["mean_true"] = float(y_true.mean())
 
+    pred_for_rank = predictions
+    if "base_value_score" in predictions.columns:
+        pred_for_rank = predictions.assign(value_score=predictions["base_value_score"])
+
     if "user_id" in predictions.columns:
-        user_spearman = _per_user_spearman(predictions, y_true)
+        user_spearman = _per_user_spearman(pred_for_rank, y_true)
         results["mean_spearman"] = float(np.nanmean(user_spearman))
         results["median_spearman"] = float(np.nanmedian(user_spearman))
         results["pct_positive_rank_corr"] = float((user_spearman > 0).mean())
@@ -32,7 +39,7 @@ def evaluate(
 
     if "user_id" in predictions.columns:
         for k in [3, 5]:
-            results[f"ndcg@{k}"] = _mean_ndcg_at_k(predictions, y_true, k)
+            results[f"ndcg@{k}"] = _mean_ndcg_at_k(pred_for_rank, y_true, k)
 
     if "tier_used" in predictions.columns:
         tier_counts = predictions["tier_used"].value_counts().sort_index()
@@ -98,9 +105,14 @@ def _confidence_calibration(
     df = pd.DataFrame({
         "pred": y_pred, "true": y_true, "conf": confidences
     })
-    df["quartile"] = pd.qcut(df["conf"], q=4, labels=["Q1", "Q2", "Q3", "Q4"])
-    cal = df.groupby("quartile").apply(
-        lambda g: mean_absolute_error(g["true"], g["pred"])
+    try:
+        df["quartile"] = pd.qcut(
+            df["conf"], q=4, labels=["Q1", "Q2", "Q3", "Q4"], duplicates="drop"
+        )
+    except ValueError:
+        return {"all": round(float(mean_absolute_error(df["true"], df["pred"])), 3)}
+    cal = df.groupby("quartile", observed=True).apply(
+        lambda g: mean_absolute_error(g["true"], g["pred"]), include_groups=False
     ).to_dict()
     return {str(k): round(float(v), 3) for k, v in cal.items()}
 

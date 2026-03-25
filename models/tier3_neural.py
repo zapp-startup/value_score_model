@@ -161,7 +161,7 @@ class NeuralValueModel:
         use_gru = cfg_nn.get("use_gru", True) and sequences is not None
         gru_seq_feat_dim = sequences.shape[-1] if sequences is not None else 8
 
-        self.net = ValueScoreNet(
+        net_kwargs = dict(
             n_users=len(unique_users),
             n_merchants=len(unique_merchants),
             feature_dim=feature_dim,
@@ -172,7 +172,9 @@ class NeuralValueModel:
             use_gru=use_gru,
             gru_seq_feat_dim=gru_seq_feat_dim,
             gru_hidden=cfg_nn.get("gru_hidden", 32),
-        ).to(self.device)
+        )
+        self._net_kwargs = net_kwargs
+        self.net = ValueScoreNet(**net_kwargs).to(self.device)
 
         optimizer = torch.optim.Adam(
             self.net.parameters(),
@@ -307,7 +309,7 @@ class NeuralValueModel:
     @classmethod
     def load(cls, path: str | Path, config: dict) -> "NeuralValueModel":
         m = cls(config)
-        state = torch.load(path, map_location="cpu")
+        state = torch.load(path, map_location="cpu", weights_only=False)
         m._user_id_map = state["user_id_map"]
         m._merchant_id_map = state["merchant_id_map"]
         m._feature_cols = state["feature_cols"]

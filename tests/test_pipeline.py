@@ -15,9 +15,11 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import tempfile
+from datetime import datetime
 
 from value_score_model.data.sample_generator import generate_sample_dataset
 from value_score_model.pipeline.feature_engineering import FeatureEngineer, build_target, DecayComputer
+from value_score_model.pipeline.overutilisation import compute_overutilisation_bonus
 from value_score_model.models.tier1_coldstart import ColdStartModel
 from value_score_model.models.tier2_xgboost import XGBoostValueModel
 from value_score_model.models.tier3_neural import NeuralValueModel
@@ -50,6 +52,54 @@ def features_and_meta(small_data, config):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# OVERUTILISATION BONUS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOverutilisation:
+
+    def test_bonus_zero_when_low_usage(self, config):
+        meta = pd.DataFrame({
+            "transaction_count_30d": [0, 1],
+            "billing_cycle_id": [2, 2],
+            "usage_decay": [0.9, 0.9],
+            "usage_frequency": [1.0, 1.0],
+            "days_since_last_used": [2.0, 2.0],
+            "days_since_started": [90.0, 90.0],
+            "total_transaction_count": [2.0, 2.0],
+        })
+        b = compute_overutilisation_bonus(meta, config)
+        assert b.max() == 0.0
+
+    def test_bonus_positive_when_heavy_usage(self, config):
+        meta = pd.DataFrame({
+            "transaction_count_30d": [25],
+            "billing_cycle_id": [2],
+            "usage_decay": [0.95],
+            "usage_frequency": [3.0],
+            "days_since_last_used": [1.0],
+            "days_since_started": [120.0],
+            "total_transaction_count": [80.0],
+        })
+        b = compute_overutilisation_bonus(meta, config)
+        assert b[0] > 5.0
+
+    def test_bonus_capped_at_config_max(self, config):
+        cfg = dict(config)
+        cfg["overutilisation"] = dict(cfg.get("overutilisation", {}), bonus_max=50)
+        meta = pd.DataFrame({
+            "transaction_count_30d": [200],
+            "billing_cycle_id": [1],
+            "usage_decay": [1.0],
+            "usage_frequency": [5.0],
+            "days_since_last_used": [0.0],
+            "days_since_started": [400.0],
+            "total_transaction_count": [5000.0],
+        })
+        b = compute_overutilisation_bonus(meta, cfg)
+        assert b[0] <= 50.0 + 1e-3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DATA GENERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -57,7 +107,7 @@ class TestDataGeneration:
 
     def test_all_keys_present(self, small_data):
         expected = {
-            "merchants", "subscriptions", "transactions",
+            "merchants", "subscriptions", "subscription_usage", "transactions",
             "user_explicit", "user_computed", "user_inferred",
             "user_facts", "feedback_signals"
         }
@@ -135,7 +185,18 @@ class TestFeatureEngineering:
 
     def test_meta_has_required_columns(self, features_and_meta):
         _, _, meta = features_and_meta
-        for col in ["user_id", "merchant_id", "subscription_id", "total_transaction_count"]:
+        for col in [
+            "user_id",
+            "merchant_id",
+            "subscription_id",
+            "total_transaction_count",
+            "transaction_count_30d",
+            "usage_frequency",
+            "days_since_last_used",
+            "days_since_started",
+            "billing_cycle_id",
+            "usage_decay",
+        ]:
             assert col in meta.columns
 
     def test_transform_without_fit_raises(self, config, small_data):
@@ -300,10 +361,14 @@ class TestValueScoreModel:
         results = model.predict(small_data)
 
         assert "value_score" in results.columns
+        assert "base_value_score" in results.columns
+        assert "overutilisation_bonus" in results.columns
         assert "confidence" in results.columns
         assert "tier_used" in results.columns
         assert len(results) > 0
-        assert ((results["value_score"] >= 0) & (results["value_score"] <= 100)).all()
+        assert ((results["value_score"] >= 0) & (results["value_score"] <= 150)).all()
+        assert (results["base_value_score"] <= 100).all()
+        assert (results["overutilisation_bonus"] <= 50.1).all()
         assert ((results["confidence"] >= 0) & (results["confidence"] <= 1)).all()
 
     def test_tier_routing(self, config, small_data):
@@ -325,12 +390,13 @@ class TestValueScoreModel:
     def test_save_load_roundtrip(self, config, small_data):
         model = ValueScoreModel(config)
         model.fit(small_data)
-        preds_before = model.predict(small_data)
+        ref = datetime(2025, 6, 1, 12, 0, 0)
+        preds_before = model.predict(small_data, reference_time=ref)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model.save(tmpdir)
             loaded = ValueScoreModel.load(tmpdir, config)
-        preds_after = loaded.predict(small_data)
+        preds_after = loaded.predict(small_data, reference_time=ref)
 
         np.testing.assert_allclose(
             preds_before["value_score"].values,

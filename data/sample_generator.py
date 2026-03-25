@@ -1,16 +1,4 @@
-"""
-temporarily generated with claude to test small scale
-
-"""
-
-
-"""
-data/sample_generator.py
--------------------------
-Generates realistic synthetic data for small-scale training and testing.
-Call generate_sample_dataset(n_users, n_merchants, seed) to get back
-DataFrames matching the schema exactly.
-"""
+"""Synthetic data for small-scale training and testing."""
 
 from __future__ import annotations
 import numpy as np
@@ -27,7 +15,7 @@ def generate_sample_dataset(
 ) -> dict[str, pd.DataFrame]:
     """
     Returns a dict of DataFrames:
-      merchants, subscriptions, transactions,
+      merchants, subscriptions, subscription_usage, transactions,
       user_explicit, user_computed, user_inferred, user_facts, feedback_signals
     """
     rng = np.random.default_rng(seed)
@@ -41,7 +29,7 @@ def generate_sample_dataset(
         "Netflix", "Spotify", "Amazon Prime", "Hulu", "Disney+",
         "Adobe CC", "GitHub", "Notion", "Gym Membership", "Costco",
         "Headspace", "Duolingo Plus", "Dropbox", "Microsoft 365",
-        "NYT Digital", "PlayStation Plus", "Crunchyroll", "HelloFresh",
+        "NYT Digital", "PlayStation Plus", "Crunchyroll", "Uber Eats",
         "Audible", "YouTube Premium"
     ][:n_merchants]
 
@@ -140,6 +128,23 @@ def generate_sample_dataset(
 
     subscriptions = pd.DataFrame(sub_rows)
 
+    # ── Subscription usage (raw metrics for preprocessor → generic signals) ──
+    usage_rows = []
+    for _, sub in subscriptions.iterrows():
+        mid = int(sub["merchant_id"])
+        name = str(merchants.loc[merchants["id"] == mid, "name"].iloc[0]).lower()
+        row: dict = {"subscription_id": int(sub["id"])}
+        if "netflix" in name:
+            row["hours_watched"] = float(rng.uniform(5, 80))
+        elif "spotify" in name:
+            row["minutes_listened"] = float(rng.uniform(100, 2500))
+        elif "amazon prime" in name:
+            row["delivery_savings_usd"] = float(rng.uniform(0, 35))
+        elif "uber eats" in name or "ubereats" in name.replace(" ", ""):
+            row["food_savings_usd"] = float(rng.uniform(0, 40))
+        usage_rows.append(row)
+    subscription_usage = pd.DataFrame(usage_rows)
+
     # ── Transactions ─────────────────────────────────────────────
     txn_rows = []
     txn_id = 1
@@ -216,6 +221,7 @@ def generate_sample_dataset(
     return {
         "merchants": merchants,
         "subscriptions": subscriptions,
+        "subscription_usage": subscription_usage,
         "transactions": transactions,
         "user_explicit": user_explicit,
         "user_computed": user_computed,

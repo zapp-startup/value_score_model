@@ -127,7 +127,7 @@ def main():
 
 def _load_from_dir(data_dir: Path) -> dict[str, pd.DataFrame]:
     keys = [
-        "merchants", "subscriptions", "transactions",
+        "merchants", "subscriptions", "subscription_usage", "transactions",
         "user_explicit", "user_computed", "user_inferred",
         "user_facts", "feedback_signals"
     ]

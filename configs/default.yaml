@@ -8,10 +8,11 @@ decay:
   usage_lambda: 0.015                  # added a decay basically to the duration of how long the product was added since it shud hold less-ish weight as time passes
   time_lambda: 0.003                   
 
+# Thresholds on 0–150 combined score (same relative cutoffs as former 0–100 scale)
 recommendation:
-  buy_threshold: 65
-  strong_buy_threshold: 85
-  skip_threshold: 35
+  buy_threshold: 97.5
+  strong_buy_threshold: 127.5
+  skip_threshold: 52.5
 
 # Feedback from user
 feedback:
@@ -51,7 +52,53 @@ training:
   test_split: 0.10
   random_state: 42
 
-# Scoring output
+# Scoring output (base 0–100 + overutilisation bonus → max 150)
 scoring:
   output_path: "outputs/daily_scores.csv"
-  save_evidence: true                
+  save_evidence: true
+  max_score: 150
+  base_score_max: 100
+
+# Extra points only when usage exceeds billing-cycle baseline (see pipeline/overutilisation.py)
+overutilisation:
+  bonus_max: 50
+  min_ratio: 1.12
+  ratio_full_saturation: 3.0
+  min_transactions_30d: 2
+  min_usage_decay: 0.35
+  recency_half_life_days: 18.0
+  composite_exponent: 1.18
+  weight_utilization: 0.42
+  weight_frequency: 0.22
+  weight_decay: 0.21
+  weight_velocity: 0.15
+
+# Map raw per-merchant metrics → subscription_utilization / subscription_cost_benefit (see pipeline/subscription_preprocessor.py)
+subscription_signals:
+  enabled: true
+  override_existing: false
+  default_utilization: 0.5
+  default_cost_benefit: 0.0
+  profiles:
+    - match: "netflix"
+      metrics:
+        - column: hours_watched
+          driver: utilization
+          baseline: 40.0
+    - match: "spotify"
+      metrics:
+        - column: minutes_listened
+          driver: utilization
+          baseline: 1200.0
+    - match: "amazon prime"
+      metrics:
+        - column: delivery_savings_usd
+          driver: cost_benefit
+          normalize: price
+    - match: "uber eats"
+      metrics:
+        - column: food_savings_usd
+          driver: cost_benefit
+          normalize: price
+    - match: "*"
+      metrics: []
