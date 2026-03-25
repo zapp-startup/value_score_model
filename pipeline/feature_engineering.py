@@ -1,11 +1,13 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Union
 import joblib
 from pathlib import Path
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+from .subscription_preprocessor import apply_subscription_preprocessor
 
 
 
@@ -20,6 +22,14 @@ RISK_TOLERANCE_VOCAB = ["low", "medium", "high"]
 BUDGET_STYLE_VOCAB = ["strict", "flexible", "optimize_value"]
 LIFE_STAGE_VOCAB = ["student", "early_career", "mid_career", "family", "pre_retirement", "retirement", "other"]
 SUB_STATUS_VOCAB = ["active", "paused", "canceled"]
+
+
+def _as_utc_timestamp(ref: Union[datetime, pd.Timestamp]) -> pd.Timestamp:
+    """Reference instant in UTC for comparisons with tz-aware DB timestamps."""
+    ts = pd.Timestamp(ref)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
 
 
 def _encode_categorical(series: pd.Series, vocab: list[str]) -> pd.Series:
@@ -82,6 +92,9 @@ class FeatureEngineer:
         # Decay multipliers
         "usage_decay",
         "time_decay",
+        # Generic subscription signals (from subscription_preprocessor; raw metrics vary by merchant)
+        "subscription_utilization",
+        "subscription_cost_benefit",
     ]
 
     CATEGORICAL_EMBEDDING_FEATURES = [
@@ -107,7 +120,9 @@ class FeatureEngineer:
 
     def fit(self, data: dict[str, pd.DataFrame], reference_time: Optional[datetime] = None) -> "FeatureEngineer":
         """Fit scaler on training data. Call once before transform."""
-        raw, _ = self._build_raw_features(data, reference_time or datetime.utcnow())
+        raw, _ = self._build_raw_features(
+            data, reference_time or datetime.now(timezone.utc)
+        )
         num_cols = [c for c in self.NUMERICAL_FEATURES if c in raw.columns]
         self.scaler.fit(raw[num_cols].fillna(0).values)
         self._fitted = True
@@ -123,7 +138,7 @@ class FeatureEngineer:
         if not self._fitted:
             raise RuntimeError("Call fe.fit() before fe.transform()")
 
-        ref = reference_time or datetime.utcnow()
+        ref = reference_time or datetime.now(timezone.utc)
         raw, meta = self._build_raw_features(data, ref)
 
 
@@ -160,6 +175,7 @@ class FeatureEngineer:
         ref: datetime,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
 
+        data = apply_subscription_preprocessor(data, self.config)
         subs = data["subscriptions"].copy()
         txns = data["transactions"].copy()
         merchants = data["merchants"].copy()
@@ -173,10 +189,10 @@ class FeatureEngineer:
         if "direction" in txns.columns:
             txns = txns[txns["direction"] == "spend"].copy()
 
-        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"])
+        ref_ts = _as_utc_timestamp(ref)
+        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"], utc=True)
 
-
-        cutoff_30d = ref - pd.Timedelta(days=30)
+        cutoff_30d = ref_ts - pd.Timedelta(days=30)
         txns_30d = txns[txns["occurred_at"] >= cutoff_30d]
 
         agg_30d = txns_30d.groupby(["user_id", "merchant_id"]).agg(
@@ -209,9 +225,9 @@ class FeatureEngineer:
         base = base.rename(columns={"category": "merchant_category"})
 
 
-        base["started_on"] = pd.to_datetime(base.get("started_on", pd.NaT))
+        base["started_on"] = pd.to_datetime(base.get("started_on", pd.NaT), utc=True)
         base["days_since_started"] = (
-            (ref - base["started_on"]).dt.days.fillna(180).clip(lower=0)
+            (ref_ts - base["started_on"]).dt.days.fillna(180).clip(lower=0)
         )
 
 
@@ -220,9 +236,9 @@ class FeatureEngineer:
         base = base.merge(fb_agg, on=["user_id", "merchant_id"], how="left")
 
 
-        base["last_used_at"] = pd.to_datetime(base.get("last_used_at", pd.NaT))
+        base["last_used_at"] = pd.to_datetime(base.get("last_used_at", pd.NaT), utc=True)
         base["days_since_last_used"] = (
-            (ref - base["last_used_at"]).dt.days.fillna(999).clip(lower=0)
+            (ref_ts - base["last_used_at"]).dt.days.fillna(999).clip(lower=0)
         )
 
 
@@ -255,6 +271,10 @@ class FeatureEngineer:
         min_fb_conf = self.config["feedback"]["min_confidence"]
         if not feedback.empty:
             fb = feedback[["user_id", "merchant_id", "feedback_value_score", "feedback_confidence"]].copy()
+            # Subscriptions often already carry these columns; merge would create _x/_y and break lookups.
+            for c in ("feedback_value_score", "feedback_confidence"):
+                if c in base.columns:
+                    base = base.drop(columns=[c])
             base = base.merge(fb, on=["user_id", "merchant_id"], how="left")
 
             base.loc[
@@ -262,8 +282,10 @@ class FeatureEngineer:
                 ["feedback_value_score", "feedback_confidence"]
             ] = 0.0
         else:
-            base["feedback_value_score"] = 0.0
-            base["feedback_confidence"] = 0.0
+            if "feedback_value_score" not in base.columns:
+                base["feedback_value_score"] = 0.0
+            if "feedback_confidence" not in base.columns:
+                base["feedback_confidence"] = 0.0
 
         base["text_feedback_score"] = _safe_fill(base, "feedback_value_score", 0.0)
         base["text_feedback_confidence"] = _safe_fill(base, "feedback_confidence", 0.0)
@@ -293,6 +315,14 @@ class FeatureEngineer:
             base, "percent_income_spent_on_subscriptions", 0.05
         )
 
+        base["subscription_utilization"] = _safe_fill(
+            base, "subscription_utilization",
+            float(self.config.get("subscription_signals", {}).get("default_utilization", 0.5)),
+        ).clip(0, 1)
+        base["subscription_cost_benefit"] = _safe_fill(
+            base, "subscription_cost_benefit",
+            float(self.config.get("subscription_signals", {}).get("default_cost_benefit", 0.0)),
+        ).clip(0, 1)
 
         base["merchant_category_id"] = _encode_categorical(
             base.get("merchant_category", pd.Series(["other"] * len(base))),
@@ -323,7 +353,20 @@ class FeatureEngineer:
         base = base.merge(total_txns, on=["user_id", "merchant_id"], how="left")
         base["total_transaction_count"] = base["total_transaction_count"].fillna(0)
 
-        meta = base[["user_id", "merchant_id", "id", "total_transaction_count"]].copy()
+        meta = base[
+            [
+                "user_id",
+                "merchant_id",
+                "id",
+                "total_transaction_count",
+                "transaction_count_30d",
+                "usage_frequency",
+                "days_since_last_used",
+                "days_since_started",
+                "billing_cycle_id",
+                "usage_decay",
+            ]
+        ].copy()
         meta = meta.rename(columns={"id": "subscription_id"})
 
         return base, meta

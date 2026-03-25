@@ -8,6 +8,7 @@ from typing import Optional
 import joblib
 
 from ..pipeline.feature_engineering import FeatureEngineer, build_target
+from ..pipeline.overutilisation import compute_overutilisation_bonus
 from .tier1_coldstart import ColdStartModel
 from .tier2_xgboost import XGBoostValueModel, BLEND_WINDOW
 from .tier3_neural import NeuralValueModel
@@ -124,7 +125,7 @@ class ValueScoreModel:
         base_df = self._get_base_df(data, meta, X)
 
         n = len(X)
-        final_scores = np.zeros(n, dtype=np.float32)
+        base_scores = np.zeros(n, dtype=np.float32)
         final_confidences = np.zeros(n, dtype=np.float32)
         tier_used = np.zeros(n, dtype=np.int8)
 
@@ -136,7 +137,7 @@ class ValueScoreModel:
 
         if t1_mask.any():
             s1, c1 = self.tier1.predict_with_confidence(base_df[t1_mask])
-            final_scores[t1_mask] = s1
+            base_scores[t1_mask] = s1
             final_confidences[t1_mask] = c1
             tier_used[t1_mask] = 1
 
@@ -146,7 +147,7 @@ class ValueScoreModel:
             s1_blend, _ = self.tier1.predict_with_confidence(base_df[t2_mask])
             alpha = np.clip(txn_counts[t2_mask] / BLEND_WINDOW, 0, 1)
             blended = alpha * s2 + (1 - alpha) * s1_blend
-            final_scores[t2_mask] = blended
+            base_scores[t2_mask] = blended
             final_confidences[t2_mask] = c2
             tier_used[t2_mask] = 2
 
@@ -157,7 +158,7 @@ class ValueScoreModel:
                     X[t3_mask], user_ids[t3_mask], merchant_ids[t3_mask],
                     txn_counts=txn_counts[t3_mask],
                 )
-                final_scores[t3_mask] = s3
+                base_scores[t3_mask] = s3
                 final_confidences[t3_mask] = c3
                 tier_used[t3_mask] = 3
             except RuntimeError:
@@ -165,22 +166,31 @@ class ValueScoreModel:
                 s2_fb, c2_fb = self.tier2.predict_with_confidence(
                     X[t3_mask], txn_counts[t3_mask]
                 )
-                final_scores[t3_mask] = s2_fb
+                base_scores[t3_mask] = s2_fb
                 final_confidences[t3_mask] = c2_fb
                 tier_used[t3_mask] = 2
 
+        base_scores = np.clip(base_scores, 0, 100)
+        over_bonus = compute_overutilisation_bonus(meta, self.config)
+        max_score = float(self.config.get("scoring", {}).get("max_score", 150))
+        base_max = float(self.config.get("scoring", {}).get("base_score_max", 100))
+        final_scores = np.clip(base_scores + over_bonus, 0, max_score)
 
         results = pd.DataFrame({
             "user_id": user_ids,
             "merchant_id": merchant_ids,
             "subscription_id": meta["subscription_id"].values,
-            "value_score": np.clip(final_scores, 0, 100).round().astype(int),
+            "base_value_score": base_scores.round().astype(int),
+            "overutilisation_bonus": over_bonus.round(1),
+            "value_score": final_scores.round().astype(int),
             "confidence": final_confidences.round(3),
             "tier_used": tier_used,
         })
 
         if self.config.get("scoring", {}).get("save_evidence", True):
-            results["evidence_json"] = self._build_evidence(X, meta, final_scores, tier_used)
+            results["evidence_json"] = self._build_evidence(
+                X, meta, base_scores, over_bonus, final_scores, tier_used
+            )
 
         return results
 
@@ -241,20 +251,20 @@ class ValueScoreModel:
         monthly_income = base["monthly_income"].replace(0, None).fillna(3000)
         base["price_norm"] = (base["price"] / monthly_income).clip(0, 1)
 
-        from ..pipeline.feature_engineering import DecayComputer
+        from ..pipeline.feature_engineering import DecayComputer, _as_utc_timestamp
         dc = DecayComputer(
             self.config["decay"]["usage_lambda"],
             self.config["decay"]["time_lambda"],
         )
         import datetime
-        ref = datetime.datetime.utcnow()
-        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"])
+        ref_ts = _as_utc_timestamp(datetime.datetime.now(datetime.timezone.utc))
+        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"], utc=True)
         latest = txns.groupby(["user_id", "merchant_id"])["occurred_at"].max().reset_index()
         latest.columns = ["user_id", "merchant_id", "last_used_at"]
         base = base.merge(latest, on=["user_id", "merchant_id"], how="left")
-        base["last_used_at"] = pd.to_datetime(base["last_used_at"])
+        base["last_used_at"] = pd.to_datetime(base["last_used_at"], utc=True)
         base["days_since_last_used"] = (
-            (ref - base["last_used_at"]).dt.days.fillna(999).clip(lower=0)
+            (ref_ts - base["last_used_at"]).dt.days.fillna(999).clip(lower=0)
         )
         base["usage_decay"] = dc.usage_decay(base["days_since_last_used"])
 
@@ -294,7 +304,9 @@ class ValueScoreModel:
         self,
         X: pd.DataFrame,
         meta: pd.DataFrame,
-        scores: np.ndarray,
+        base_scores: np.ndarray,
+        over_bonus: np.ndarray,
+        final_scores: np.ndarray,
         tiers: np.ndarray,
     ) -> list[dict]:
         key_features = [
@@ -303,11 +315,14 @@ class ValueScoreModel:
             "repurchase_likelihood_norm", "usage_decay", "time_decay",
             "text_feedback_score", "text_feedback_confidence",
             "transaction_count_30d",
+            "subscription_utilization", "subscription_cost_benefit",
         ]
         evidence = []
         for i, row in X.iterrows():
             snap = {col: round(float(row[col]), 4) for col in key_features if col in X.columns}
             snap["tier_used"] = int(tiers[i] if i < len(tiers) else 0)
-            snap["raw_score"] = round(float(scores[i] if i < len(scores) else 0), 2)
+            snap["base_value_score"] = round(float(base_scores[i] if i < len(base_scores) else 0), 2)
+            snap["overutilisation_bonus"] = round(float(over_bonus[i] if i < len(over_bonus) else 0), 2)
+            snap["final_score"] = round(float(final_scores[i] if i < len(final_scores) else 0), 2)
             evidence.append(snap)
         return evidence
