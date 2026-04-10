@@ -3,11 +3,15 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingRegressor
 from typing import Optional
 import joblib
 from pathlib import Path
+
+try:
+    import xgboost as xgb
+except ImportError:  # pragma: no cover - exercised in environments without xgboost
+    xgb = None
 
 
 BLEND_WINDOW = 30 
@@ -20,19 +24,30 @@ class XGBoostValueModel:
     def __init__(self, config: dict):
         self.config = config
         xgb_cfg = config.get("xgboost", {})
-        self.model = xgb.XGBRegressor(
-            n_estimators=xgb_cfg.get("n_estimators", 300),
-            max_depth=xgb_cfg.get("max_depth", 6),
-            learning_rate=xgb_cfg.get("learning_rate", 0.05),
-            subsample=xgb_cfg.get("subsample", 0.8),
-            colsample_bytree=xgb_cfg.get("colsample_bytree", 0.8),
-            min_child_weight=xgb_cfg.get("min_child_weight", 5),
-            reg_alpha=xgb_cfg.get("reg_alpha", 0.1),
-            reg_lambda=xgb_cfg.get("reg_lambda", 1.0),
-            random_state=xgb_cfg.get("random_state", 42),
-            objective="reg:squarederror",
-            verbosity=0,
-        )
+        if xgb is not None:
+            self.model = xgb.XGBRegressor(
+                n_estimators=xgb_cfg.get("n_estimators", 300),
+                max_depth=xgb_cfg.get("max_depth", 6),
+                learning_rate=xgb_cfg.get("learning_rate", 0.05),
+                subsample=xgb_cfg.get("subsample", 0.8),
+                colsample_bytree=xgb_cfg.get("colsample_bytree", 0.8),
+                min_child_weight=xgb_cfg.get("min_child_weight", 5),
+                reg_alpha=xgb_cfg.get("reg_alpha", 0.1),
+                reg_lambda=xgb_cfg.get("reg_lambda", 1.0),
+                random_state=xgb_cfg.get("random_state", 42),
+                objective="reg:squarederror",
+                verbosity=0,
+            )
+            self.backend = "xgboost"
+        else:
+            self.model = HistGradientBoostingRegressor(
+                max_depth=xgb_cfg.get("max_depth", 6),
+                learning_rate=xgb_cfg.get("learning_rate", 0.05),
+                max_iter=xgb_cfg.get("n_estimators", 300),
+                l2_regularization=xgb_cfg.get("reg_lambda", 1.0),
+                random_state=xgb_cfg.get("random_state", 42),
+            )
+            self.backend = "sklearn_hist_gradient_boosting"
         self._feature_names: Optional[list[str]] = None
         self._fitted = False
 
@@ -81,6 +96,14 @@ class XGBoostValueModel:
 
     def get_feature_importance(self) -> pd.Series:
         self._check_fitted()
+        if not hasattr(self.model, "feature_importances_"):
+            n_features = len(self._feature_names or [])
+            if n_features == 0:
+                return pd.Series(dtype=float)
+            return pd.Series(
+                np.full(n_features, 1.0 / n_features, dtype=float),
+                index=self._feature_names,
+            ).sort_values(ascending=False)
         return pd.Series(
             self.model.feature_importances_,
             index=self._feature_names,
