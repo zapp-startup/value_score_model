@@ -107,3 +107,34 @@ def compute_overutilisation_bonus(meta: pd.DataFrame, config: dict) -> np.ndarra
         * gate_decay
     )
     return np.clip(bonus, 0.0, bonus_max).astype(np.float32)
+
+
+def apply_overutilisation_guardrails(
+    base_scores: np.ndarray,
+    bonus: np.ndarray,
+    config: dict,
+) -> np.ndarray:
+    """
+    Post-process raw bonus using learned base (0–learned_max). Zeros bonus when base is
+    below min_base_score_for_any_bonus. Optional bonus_ramp_top_base: linear ramp of the
+    bonus multiplier from 0 at min_base to 1 at ramp_top (only applies where base >= min_base).
+    """
+    cfg = config.get("overutilisation", {})
+    bonus_max = float(cfg.get("bonus_max", 50))
+    out = np.asarray(bonus, dtype=np.float32).copy()
+    base_scores = np.asarray(base_scores, dtype=np.float64)
+
+    min_any = float(cfg.get("min_base_score_for_any_bonus", 0))
+    ramp_top = float(cfg.get("bonus_ramp_top_base", 0))
+
+    if min_any > 0:
+        out = np.where(base_scores < min_any, 0.0, out)
+        if ramp_top > min_any:
+            mult = np.clip((base_scores - min_any) / (ramp_top - min_any), 0.0, 1.0)
+            out = np.where(base_scores < min_any, 0.0, out * mult.astype(np.float32))
+        return np.clip(out, 0.0, bonus_max).astype(np.float32)
+
+    if ramp_top > 0:
+        mult = np.clip(base_scores / ramp_top, 0.0, 1.0)
+        out = (out * mult.astype(np.float32))
+    return np.clip(out, 0.0, bonus_max).astype(np.float32)

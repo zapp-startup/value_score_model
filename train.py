@@ -11,7 +11,7 @@ from sklearn.model_selection import GroupShuffleSplit
 from value_score_model.models.value_score_model import ValueScoreModel
 from value_score_model.pipeline.feature_engineering import FeatureEngineer, build_target
 from value_score_model.data.sample_generator import generate_sample_dataset
-from value_score_model.evaluation.metrics import evaluate
+from value_score_model.evaluation.metrics import evaluate, evaluate_display_metrics
 from value_score_model.config import load_config
 
 
@@ -95,17 +95,20 @@ def main():
 
     print("Evaluating on test set...")
     fe = model.feature_engineer
+    ref_eval = datetime.utcnow()
 
-    X_test, meta_test = fe.transform(test_data)
-    base_test = model._rebuild_base_for_target(test_data, meta_test)
+    X_test, meta_test = fe.transform(test_data, reference_time=ref_eval)
+    base_test = model._rebuild_base_for_target(test_data, meta_test, ref_eval)
     y_test = build_target(base_test, test_data["user_computed"], config)
 
-    predictions = model.predict(test_data)
+    predictions = model.predict(test_data, reference_time=ref_eval)
     predictions_aligned = predictions.reset_index(drop=True)
     y_test_aligned = y_test.reset_index(drop=True).iloc[:len(predictions_aligned)]
 
     metrics = evaluate(predictions_aligned, y_test_aligned, verbose=True)
-
+    metrics["display_metrics"] = evaluate_display_metrics(
+        predictions_aligned, y_test_aligned
+    )
 
     model_dir = Path(args.model_dir)
     model.save(model_dir)

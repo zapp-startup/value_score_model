@@ -8,11 +8,17 @@ decay:
   usage_lambda: 0.015                  # added a decay basically to the duration of how long the product was added since it shud hold less-ish weight as time passes
   time_lambda: 0.003                   
 
-# Thresholds on 0–150 combined score (same relative cutoffs as former 0–100 scale)
+# Recommendations: thresholds apply to the column named by score_column (see scoring contract).
+# - score_column: combined → compare to value_score (base + bonus, 0..display_max)
+# - score_column: base → compare to base_value_score (learned only, 0..learned_score_max)
 recommendation:
+  score_column: combined
   buy_threshold: 97.5
   strong_buy_threshold: 127.5
   skip_threshold: 52.5
+  base_buy_threshold: 65
+  base_strong_buy_threshold: 85
+  base_skip_threshold: 35
 
 # Feedback from user
 feedback:
@@ -52,16 +58,29 @@ training:
   test_split: 0.10
   random_state: 42
 
-# Scoring output (base 0–100 + overutilisation bonus → max 150)
+# Score contract (two-channel):
+# - learned_score_max: scale for tiers + build_target y (always 0..100 today)
+# - display_max: clip for value_score = base + bonus (backward alias: max_score)
+# - value_score = display/combined; base_value_score = learned; always export both.
 scoring:
   output_path: "outputs/daily_scores.csv"
   save_evidence: true
+  learned_score_max: 100
+  display_max: 150
   max_score: 150
   base_score_max: 100
+
+# TransactionValueModel: scale for valuations_transactionvaluation.value_score → learned_score_max
+transaction_training:
+  label_max: 150
+  min_supervised_rows: 50
 
 # Extra points only when usage exceeds billing-cycle baseline (see pipeline/overutilisation.py)
 overutilisation:
   bonus_max: 50
+  # Guardrails (Phase A2): suppress bonus when learned base is weak (0–100 scale)
+  min_base_score_for_any_bonus: 36
+  suppress_bonus_when_base_below_skip: false
   min_ratio: 1.12
   ratio_full_saturation: 3.0
   min_transactions_30d: 2

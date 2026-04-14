@@ -19,12 +19,21 @@ from datetime import datetime
 
 from value_score_model.data.sample_generator import generate_sample_dataset
 from value_score_model.pipeline.feature_engineering import FeatureEngineer, build_target, DecayComputer
-from value_score_model.pipeline.overutilisation import compute_overutilisation_bonus
+from value_score_model.pipeline.overutilisation import (
+    apply_overutilisation_guardrails,
+    compute_overutilisation_bonus,
+)
+from value_score_model.pipeline.txn_feature_engineering import (
+    build_transaction_supervised_frame,
+    build_transaction_training_frame,
+)
+from value_score_model.models.transaction_value_model import TransactionValueModel
+from value_score_model.config import recommendation_thresholds, scoring_scale
 from value_score_model.models.tier1_coldstart import ColdStartModel
 from value_score_model.models.tier2_xgboost import XGBoostValueModel
 from value_score_model.models.tier3_neural import NeuralValueModel
 from value_score_model.models.value_score_model import ValueScoreModel
-from value_score_model.evaluation.metrics import evaluate
+from value_score_model.evaluation.metrics import evaluate, evaluate_display_metrics
 from value_score_model.config import load_config
 
 
@@ -370,6 +379,16 @@ class TestValueScoreModel:
         assert (results["base_value_score"] <= 100).all()
         assert (results["overutilisation_bonus"] <= 50.1).all()
         assert ((results["confidence"] >= 0) & (results["confidence"] <= 1)).all()
+        assert "display_value_score" in results.columns
+        assert (results["display_value_score"] == results["value_score"]).all()
+
+    def test_combined_score_at_least_base(self, config, small_data):
+        model = ValueScoreModel(config)
+        model.fit(small_data)
+        results = model.predict(small_data)
+        assert (
+            results["value_score"] + 1 >= results["base_value_score"]
+        ).all()
 
     def test_tier_routing(self, config, small_data):
         model = ValueScoreModel(config)
@@ -415,6 +434,83 @@ class TestValueScoreModel:
         model.fit(data)
         results = model.predict(data)
         assert len(results) > 0
+
+
+class TestScoreContractConfig:
+
+    def test_scoring_scale_keys(self, config):
+        s = scoring_scale(config)
+        assert s["learned_max"] == 100
+        assert s["display_max"] == 150
+
+    def test_recommendation_thresholds_combined(self, config):
+        col, thr = recommendation_thresholds(config)
+        assert col == "combined"
+        assert thr["buy"] > 90
+
+    def test_recommendation_thresholds_base(self, config):
+        cfg = dict(config)
+        cfg["recommendation"] = dict(cfg.get("recommendation", {}), score_column="base")
+        col, thr = recommendation_thresholds(cfg)
+        assert col == "base"
+        assert thr["buy"] == 65
+
+
+class TestOverutilisationGuardrails:
+
+    def test_bonus_zeroed_when_base_low(self, config):
+        cfg = dict(config)
+        cfg["overutilisation"] = dict(
+            cfg.get("overutilisation", {}),
+            min_base_score_for_any_bonus=50,
+            bonus_max=50,
+        )
+        base = np.array([30.0, 80.0], dtype=np.float32)
+        bonus = np.array([40.0, 40.0], dtype=np.float32)
+        out = apply_overutilisation_guardrails(base, bonus, cfg)
+        assert out[0] == 0.0
+        assert out[1] == 40.0
+
+
+class TestTxnFeatureAndTransactionModel:
+
+    def test_build_transaction_frame(self, small_data):
+        ref = datetime(2024, 1, 1, 12, 0, 0)
+        X, y, uid = build_transaction_training_frame(small_data, reference_time=ref)
+        assert len(X) == len(y) == len(uid) > 0
+        assert float(y.max()) <= 100.0
+
+    def test_transaction_value_model_fit(self, small_data, config):
+        ref = datetime(2024, 1, 1, 12, 0, 0)
+        X, y, _ = build_transaction_training_frame(small_data, reference_time=ref)
+        cfg = dict(config)
+        cfg["transaction_xgboost"] = {"n_estimators": 20, "max_depth": 4}
+        m = TransactionValueModel(cfg)
+        n = min(200, len(X))
+        m.fit(X.iloc[:n], y.iloc[:n])
+        p = m.predict(X.iloc[: min(50, len(X))])
+        assert len(p) == min(50, len(X))
+        assert (p >= 0).all() and (p <= 100).all()
+
+    def test_build_transaction_supervised_frame(self, small_data, config):
+        tx = small_data["transactions"].copy()
+        # Label a subset of spend txns
+        spend_ids = tx.loc[tx["direction"] == "spend", "id"].head(15).tolist()
+        tv = pd.DataFrame(
+            {
+                "transaction_id": spend_ids,
+                "value_score": [75] * len(spend_ids),
+            }
+        )
+        data = dict(small_data)
+        data["transaction_valuations"] = tv
+        cfg = dict(config)
+        cfg["transaction_training"] = {"label_max": 150, "min_supervised_rows": 5}
+        out = build_transaction_supervised_frame(data, cfg)
+        assert out is not None
+        X, y, uid = out
+        assert len(X) == len(y) == len(uid) == len(spend_ids)
+        assert float(y.min()) >= 0 and float(y.max()) <= 100.5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -465,3 +561,14 @@ class TestEvaluationMetrics:
         results = evaluate(preds, y, verbose=False)
         assert "confidence_calibration" in results
         assert len(results["confidence_calibration"]) == 4
+
+    def test_evaluate_display_metrics(self):
+        y = pd.Series(np.full(20, 50.0))
+        preds = pd.DataFrame({
+            "user_id": np.repeat(np.arange(4), 5),
+            "base_value_score": np.full(20, 48.0),
+            "value_score": np.full(20, 110.0),
+        })
+        dm = evaluate_display_metrics(preds, y)
+        assert "display_mae" in dm
+        assert dm["display_mae"] == pytest.approx(60.0, abs=0.01)

@@ -190,7 +190,10 @@ class FeatureEngineer:
             txns = txns[txns["direction"] == "spend"].copy()
 
         ref_ts = _as_utc_timestamp(ref)
-        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"], utc=True)
+        # Exports mix ISO8601 with/without subseconds; avoid single-strptime inference errors.
+        txns["occurred_at"] = pd.to_datetime(
+            txns["occurred_at"], utc=True, format="mixed"
+        )
 
         cutoff_30d = ref_ts - pd.Timedelta(days=30)
         txns_30d = txns[txns["occurred_at"] >= cutoff_30d]

@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 from ..models.value_score_model import ValueScoreModel
-from ..config import load_config
+from ..config import load_config, recommendation_thresholds
 
 
 def run_daily_scoring(
@@ -51,10 +51,13 @@ def run_daily_scoring(
     results["scored_at"] = ref.isoformat()
 
 
-    rec_cfg = config.get("recommendation", {})
-    strong_buy = rec_cfg.get("strong_buy_threshold", 85)
-    buy = rec_cfg.get("buy_threshold", 65)
-    skip = rec_cfg.get("skip_threshold", 35)
+    score_col, thr = recommendation_thresholds(config)
+    score_series = (
+        results["base_value_score"]
+        if score_col == "base"
+        else results["value_score"]
+    )
+    strong_buy, buy, skip = thr["strong_buy"], thr["buy"], thr["skip"]
 
     def score_to_recommendation(score: int) -> str:
         if score >= strong_buy:
@@ -66,7 +69,8 @@ def run_daily_scoring(
         else:
             return "wait"
 
-    results["recommendation"] = results["value_score"].apply(score_to_recommendation)
+    results["recommendation_score_column"] = score_col
+    results["recommendation"] = score_series.apply(score_to_recommendation)
 
 
     if "evidence_json" in results.columns:
@@ -76,11 +80,15 @@ def run_daily_scoring(
 
 
     print(f"\nScoring complete. {len(results)} scores generated.")
-    print(f"  Score distribution:")
+    print(f"  Recommendations use score column: {score_col}")
+    print(f"  Score distribution (value_score / display):")
     print(f"    Mean:   {results['value_score'].mean():.1f}")
     print(f"    Median: {results['value_score'].median():.1f}")
     print(f"    Min:    {results['value_score'].min()}")
     print(f"    Max:    {results['value_score'].max()}")
+    print(f"  Base (learned) distribution:")
+    print(f"    Mean:   {results['base_value_score'].mean():.1f}")
+    print(f"    Median: {results['base_value_score'].median():.1f}")
     print(f"  Tier breakdown: {results['tier_used'].value_counts().sort_index().to_dict()}")
     print(f"  Recommendations: {results['recommendation'].value_counts().to_dict()}")
 

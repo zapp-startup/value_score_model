@@ -56,6 +56,26 @@ def evaluate(
     return results
 
 
+def evaluate_display_metrics(
+    predictions: pd.DataFrame,
+    ground_truth: pd.Series,
+) -> dict:
+    """
+    Monitoring only: MAE/RMSE of combined ``value_score`` (base + bonus) vs the same
+    proxy ``ground_truth`` used for training. Do not use for model selection — the
+    learned objective is 0–learned_max; combined scores mix rule-based bonus.
+    """
+    if "value_score" not in predictions.columns:
+        return {}
+    y_pred = predictions["value_score"].values.astype(float)
+    y_true = ground_truth.values.astype(float)
+    return {
+        "display_mae": float(mean_absolute_error(y_true, y_pred)),
+        "display_rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "display_mean_pred": float(y_pred.mean()),
+    }
+
+
 def _per_user_spearman(predictions: pd.DataFrame, y_true: np.ndarray) -> np.ndarray:
     pred_df = predictions.copy()
     pred_df["_true"] = y_true

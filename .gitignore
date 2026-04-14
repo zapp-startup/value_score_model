@@ -1,2 +1,10 @@
 venv/
 __pycache__/
+training_data/
+training2/
+training3/
+outputs/
+
+# Large generated evaluation artifacts
+outputs/*.csv
+outputs/*.jsonl

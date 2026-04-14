@@ -8,11 +8,14 @@ from typing import Optional
 import joblib
 
 from ..pipeline.feature_engineering import FeatureEngineer, build_target
-from ..pipeline.overutilisation import compute_overutilisation_bonus
+from ..pipeline.overutilisation import (
+    apply_overutilisation_guardrails,
+    compute_overutilisation_bonus,
+)
+from ..config import load_config, scoring_scale
 from .tier1_coldstart import ColdStartModel
 from .tier2_xgboost import XGBoostValueModel, BLEND_WINDOW
 from .tier3_neural import NeuralValueModel
-from ..config import load_config
 
 
 class ValueScoreModel:
@@ -53,7 +56,7 @@ class ValueScoreModel:
 
         print("[1/4] Feature engineering...")
         X, meta = self.feature_engineer.fit_transform(data, reference_time)
-        base_df = self._rebuild_base_for_target(data, meta)
+        base_df = self._rebuild_base_for_target(data, meta, reference_time)
         y = build_target(base_df, data["user_computed"], self.config)
         y = y.reset_index(drop=True).iloc[:len(X)]
 
@@ -64,7 +67,7 @@ class ValueScoreModel:
         X_val, meta_val, y_val = None, None, None
         if val_data:
             X_val, meta_val = self.feature_engineer.transform(val_data, reference_time)
-            base_val = self._rebuild_base_for_target(val_data, meta_val)
+            base_val = self._rebuild_base_for_target(val_data, meta_val, reference_time)
             y_val = build_target(base_val, val_data["user_computed"], self.config)
 
 
@@ -170,11 +173,13 @@ class ValueScoreModel:
                 final_confidences[t3_mask] = c2_fb
                 tier_used[t3_mask] = 2
 
-        base_scores = np.clip(base_scores, 0, 100)
+        scales = scoring_scale(self.config)
+        learned_max = scales["learned_max"]
+        display_max = scales["display_max"]
+        base_scores = np.clip(base_scores, 0, learned_max)
         over_bonus = compute_overutilisation_bonus(meta, self.config)
-        max_score = float(self.config.get("scoring", {}).get("max_score", 150))
-        base_max = float(self.config.get("scoring", {}).get("base_score_max", 100))
-        final_scores = np.clip(base_scores + over_bonus, 0, max_score)
+        over_bonus = apply_overutilisation_guardrails(base_scores, over_bonus, self.config)
+        final_scores = np.clip(base_scores + over_bonus, 0, display_max)
 
         results = pd.DataFrame({
             "user_id": user_ids,
@@ -183,6 +188,7 @@ class ValueScoreModel:
             "base_value_score": base_scores.round().astype(int),
             "overutilisation_bonus": over_bonus.round(1),
             "value_score": final_scores.round().astype(int),
+            "display_value_score": final_scores.round().astype(int),
             "confidence": final_confidences.round(3),
             "tier_used": tier_used,
         })
@@ -225,7 +231,10 @@ class ValueScoreModel:
 
 
     def _rebuild_base_for_target(
-        self, data: dict, meta: pd.DataFrame
+        self,
+        data: dict,
+        meta: pd.DataFrame,
+        reference_time=None,
     ) -> pd.DataFrame:
         """Get raw base dataframe with un-scaled features for target building."""
         subs = data["subscriptions"].copy()
@@ -252,13 +261,22 @@ class ValueScoreModel:
         base["price_norm"] = (base["price"] / monthly_income).clip(0, 1)
 
         from ..pipeline.feature_engineering import DecayComputer, _as_utc_timestamp
+        import datetime as _dt
+
         dc = DecayComputer(
             self.config["decay"]["usage_lambda"],
             self.config["decay"]["time_lambda"],
         )
-        import datetime
-        ref_ts = _as_utc_timestamp(datetime.datetime.now(datetime.timezone.utc))
-        txns["occurred_at"] = pd.to_datetime(txns["occurred_at"], utc=True)
+        # Align with feature_engineering / fit(reference_time); wall clock would
+        # make historical txns look "stale" and zero out usage_decay in targets.
+        ref_ts = (
+            _as_utc_timestamp(reference_time)
+            if reference_time is not None
+            else _as_utc_timestamp(_dt.datetime.now(_dt.timezone.utc))
+        )
+        txns["occurred_at"] = pd.to_datetime(
+            txns["occurred_at"], utc=True, format="mixed"
+        )
         latest = txns.groupby(["user_id", "merchant_id"])["occurred_at"].max().reset_index()
         latest.columns = ["user_id", "merchant_id", "last_used_at"]
         base = base.merge(latest, on=["user_id", "merchant_id"], how="left")
